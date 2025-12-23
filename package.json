@@ -1,0 +1,10 @@
+{
+  "name": "k3s-autoscaler",
+  "private": true,
+  "packageManager": "pnpm@9.0.0",
+  "scripts": {
+    "svc:checkout:dev": "pnpm --filter checkout dev",
+    "infra:up": "pnpm --filter infra-pulumi up",
+    "infra:down": "pnpm --filter infra-pulumi destroy"
+  }
+}

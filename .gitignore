@@ -1,0 +1,55 @@
+# Dependencies
+node_modules
+.pnpm
+
+# Lockfiles (keep pnpm-lock.yaml, exclude others)
+package-lock.json
+yarn.lock
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# Build outputs
+dist
+build
+*.tsbuildinfo
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+pnpm-error.log*
+lerna-debug.log*
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+.DS_Store
+*.sublime-workspace
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Temporary files
+*.tmp
+.cache
+
+# Testing
+coverage
+.nyc_output
+
+# Pulumi
+Pulumi.*.yaml
+!Pulumi.yaml
+!Pulumi.dev.yaml
+!Pulumi.dev-new.yaml
+.pulumi

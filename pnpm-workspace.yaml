@@ -1,0 +1,5 @@
+packages:
+  - "services/*"
+  - "infra/*"
+  - "platform/*"
+  - "load/*"
