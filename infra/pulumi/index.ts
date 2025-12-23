@@ -95,6 +95,12 @@ const sgWorker = new aws.ec2.SecurityGroup("sg_worker", {
   ingress: [
     { protocol: "tcp", fromPort: 22, toPort: 22, cidrBlocks: [myIpCidr] },
     { protocol: "tcp", fromPort: 30080, toPort: 30080, cidrBlocks: [myIpCidr] }, // SSH
+    {
+      protocol: "tcp",
+      fromPort: prometheusNodePort,
+      toPort: prometheusNodePort,
+      cidrBlocks: [myIpCidr],
+    }, // Accessible from outside
   ],
   egress: [
     { protocol: "-1", fromPort: 0, toPort: 0, cidrBlocks: ["0.0.0.0/0"] },
@@ -165,7 +171,7 @@ export const lambdaSgId = sgLambda.id;
 export const promNodePort = prometheusNodePort;
 
 // PEM File Name For K3s Master EC2 Instance
-const keyName = "k3s-master-key-3";
+const keyName = "k3s-master-key-4";
 
 const masterRole = new aws.iam.Role("k3s-master-role", {
   assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
