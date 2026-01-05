@@ -1,0 +1,25 @@
+{
+  "name": "autoscaler",
+  "version": "1.0.0",
+  "private": true,
+  "description": "",
+  "main": "dist/lambda/handler.js",
+  "scripts": {
+    "build": "tsup lambda/handler.ts --format cjs --platform node --target node20 --outDir dist --clean --no-external axios",
+    "dev": "node dist/lambda/handler.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.958.0",
+    "@aws-sdk/client-ec2": "^3.958.0",
+    "@aws-sdk/client-ssm": "^3.958.0",
+    "axios": "^1.13.2"
+  },
+  "devDependencies": {
+    "@types/node": "^18",
+    "tsup": "^8.5.1",
+    "typescript": "^5.9.3"
+  }
+}
