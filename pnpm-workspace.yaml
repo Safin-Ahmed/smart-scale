@@ -1,5 +1,4 @@
 packages:
   - "services/*"
   - "infra/*"
-  - "platform/*"
-  - "load/*"
+  - "autoscaler"

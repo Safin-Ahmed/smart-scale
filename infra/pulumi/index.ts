@@ -152,6 +152,35 @@ new aws.ec2.SecurityGroupRule("master-allow-prometheus-request-from-lambda", {
   description: "Allow Prometheus requests from Lambda",
 });
 
+new aws.ec2.SecurityGroupRule("workers-allow-prometheus-from-lambda", {
+  type: "ingress",
+  securityGroupId: sgWorker.id,
+  sourceSecurityGroupId: sgLambda.id,
+  fromPort: prometheusNodePort,
+  toPort: prometheusNodePort,
+  protocol: "tcp",
+  description: "Allow Prometheus NodePort from Lambda",
+});
+
+new aws.ec2.SecurityGroupRule("lambda-sg-allow-https-self", {
+  type: "ingress",
+  securityGroupId: sgLambda.id,
+  sourceSecurityGroupId: sgLambda.id,
+  protocol: "tcp",
+  fromPort: 443,
+  toPort: 443,
+  description: "Allow Lambda SG to reach Interface VPC Endpoints over HTTPS",
+});
+
+new aws.ec2.SecurityGroupRule("lambda-allow-vpc-https", {
+  type: "ingress",
+  securityGroupId: sgLambda.id,
+  cidrBlocks: [vpcCidr], // Allow entire VPC to hit the endpoint
+  protocol: "tcp",
+  fromPort: 443,
+  toPort: 443,
+});
+
 new aws.ec2.SecurityGroupRule("workers-allow-all-from-workers", {
   type: "ingress",
   securityGroupId: sgWorker.id,
@@ -171,7 +200,7 @@ export const lambdaSgId = sgLambda.id;
 export const promNodePort = prometheusNodePort;
 
 // PEM File Name For K3s Master EC2 Instance
-const keyName = "k3s-master-key-4";
+const keyName = "k3s_master_key_v5";
 
 const masterRole = new aws.iam.Role("k3s-master-role", {
   assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
@@ -219,6 +248,9 @@ curl -sfL https://get.k3s.io | sh -s - server \\
 
 sleep 5
 k3s kubectl get nodes || true
+
+snap install amazon-ssm-agent --classic || true
+systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent || true
 `;
 
 const masterInstance = new aws.ec2.Instance("k3s-master", {
@@ -232,6 +264,7 @@ const masterInstance = new aws.ec2.Instance("k3s-master", {
   tags: {
     Name: "k3s-master",
     Role: "k3s-control-plane",
+    Cluster: "k3s-autoscaler",
   },
 });
 
@@ -245,13 +278,18 @@ apt-get install -y curl
 export K3S_URL="https://${masterInstance.privateIp}:6443"
 export K3S_TOKEN="${clusterToken}"
 
-for i in $(seq 1 120); do
+# Wait for the master to be ready. Try for ~2 minutes (24 * 5s).
+for i in $(seq 1 24); do
+  echo "[k3s-join] checking master ready (attempt $i)" >&2
   if curl -k --silent --fail https://${masterInstance.privateIp}:6443/readyz >/dev/null; then
+    echo "[k3s-join] master ready" >&2
     break
   fi
   sleep 5
 done
 
+# If master wasn't detected, continue anyway and let k3s agent retry.
+echo "[k3s-join] proceeding to install k3s agent" >&2
 curl -sfL https://get.k3s.io | sh -s - agent
 `;
 
@@ -281,6 +319,7 @@ const worker1 = new aws.ec2.Instance(
     vpcSecurityGroupIds: [sgWorker.id],
     keyName: keyName,
     userData: workerUserData,
+    iamInstanceProfile: masterInstanceProfile.name,
     tags: {
       Name: "k3s-worker-1",
       Role: "k3s-worker",
@@ -299,6 +338,7 @@ const worker2 = new aws.ec2.Instance(
     vpcSecurityGroupIds: [sgWorker.id],
     keyName: keyName,
     userData: workerUserData,
+    iamInstanceProfile: masterInstanceProfile.name,
     tags: {
       Name: "k3s-worker-2",
       Role: "k3s-worker",
@@ -307,6 +347,204 @@ const worker2 = new aws.ec2.Instance(
   },
   { dependsOn: masterInstance }
 );
+
+const autoscalerTable = new aws.dynamodb.Table("k3s-autoscaler-state", {
+  attributes: [{ name: "pk", type: "S" }],
+  hashKey: "pk",
+  billingMode: "PAY_PER_REQUEST",
+  tags: { Name: "k3s-autoscaler-state" },
+});
+
+const autoscalerLogsTable = new aws.dynamodb.Table("k3s-autoscaler-logs", {
+  attributes: [
+    { name: "pk", type: "S" },
+    { name: "sk", type: "S" },
+  ],
+  hashKey: "pk",
+  rangeKey: "sk",
+  billingMode: "PAY_PER_REQUEST",
+  tags: { Name: "k3s-autoscaler-logs" },
+});
+
+const lambdaCode = new pulumi.asset.AssetArchive({
+  ".": new pulumi.asset.FileArchive("../../autoscaler/dist"),
+});
+
+const autoscalerRole = new aws.iam.Role("k3s-autoscaler-role", {
+  assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
+    Service: "lambda.amazonaws.com",
+  }),
+});
+
+new aws.iam.RolePolicy("k3s-autoscaler-policy", {
+  role: autoscalerRole.id,
+  policy: pulumi
+    .all([autoscalerTable.arn, autoscalerLogsTable.arn, masterRole.arn])
+    .apply(([stateArn, logsArn, masterRoleArn]) =>
+      JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Effect: "Allow",
+            Action: [
+              "dynamodb:GetItem",
+              "dynamodb:PutItem",
+              "dynamodb:UpdateItem",
+            ],
+            Resource: stateArn,
+          },
+          {
+            Effect: "Allow",
+            Action: ["dynamodb:PutItem"],
+            Resource: logsArn,
+          },
+          {
+            Effect: "Allow",
+            Action: [
+              "ec2:DescribeInstances",
+              "ec2:DescribeInstanceStatus",
+              "ec2:TerminateInstances",
+            ],
+            Resource: "*",
+          },
+          {
+            Effect: "Allow",
+            Action: ["ec2:RunInstances", "ec2:CreateTags"],
+            Resource: "*",
+          },
+          {
+            Effect: "Allow",
+            Action: ["iam:PassRole"],
+            Resource: masterRoleArn,
+          },
+          {
+            Effect: "Allow",
+            Action: [
+              "ssm:SendCommand",
+              "ssm:GetCommandInvocation",
+              "ssm:ListCommandInvocations",
+            ],
+            Resource: "*",
+          },
+        ],
+      })
+    ),
+});
+
+new aws.iam.RolePolicyAttachment("k3s-autoscaler-basic-exec", {
+  role: autoscalerRole.name,
+  policyArn: aws.iam.ManagedPolicy.AWSLambdaBasicExecutionRole,
+});
+
+new aws.iam.RolePolicyAttachment("k3s-autoscaler-vpc-access", {
+  role: autoscalerRole.name,
+  policyArn: aws.iam.ManagedPolicy.AWSLambdaVPCAccessExecutionRole,
+});
+
+const autoscalerFn = new aws.lambda.Function("k3s-autoscaler", {
+  runtime: "nodejs20.x",
+  role: autoscalerRole.arn,
+  handler: "handler.handler",
+  code: lambdaCode,
+  timeout: 120,
+  memorySize: 256,
+  environment: {
+    variables: {
+      STATE_TABLE: autoscalerTable.name,
+      PROM_NODEPORT: "30900",
+      WORKER_TAG_KEY: "Role",
+      WORKER_TAG_VALUE: "k3s-worker",
+      LOGS_TABLE: autoscalerLogsTable.name,
+      CPU_UP: "0.70",
+      CPU_DOWN: "0.30",
+      PENDING_UP_SEC: "180",
+      IDLE_DOWN_SEC: "600",
+      COOLDOWN_UP_SEC: "300",
+      DRAIN_TIMEOUT_SEC: "300",
+      COOLDOWN_DOWN_SEC: "600",
+      JOIN_TIMEOUT_SEC: "600",
+      MIN_WORKERS: "2",
+      MAX_WORKERS: "10",
+      MASTER_TAG_KEY: "Role",
+      MASTER_TAG_VALUE: "k3s-control-plane",
+      CLUSTER_TAG_KEY: "Cluster",
+      CLUSTER_TAG_VALUE: "k3s-autoscaler",
+      WORKER_AMI_ID: pulumi.output(ubuntu2204).apply((a) => a.id),
+      WORKER_INSTANCE_TYPE: "t3.medium",
+      WORKER_SUBNET_IDS: pulumi.interpolate`${subnetA.id},${subnetB.id}`,
+      WORKER_SG_ID: sgWorker.id,
+      WORKER_KEY_NAME: keyName,
+      K3S_TOKEN: clusterToken,
+      WORKER_INSTANCE_PROFILE: masterInstanceProfile.name,
+      PODS_PER_NODE: "10",
+      MAX_BATCH_UP: "2",
+    },
+  },
+  vpcConfig: {
+    subnetIds: [subnetA.id, subnetB.id],
+    securityGroupIds: [sgLambda.id],
+  },
+});
+
+// const scheduleRule = new aws.cloudwatch.EventRule("k3s-autoscaler-every-2m", {
+//   scheduleExpression: "rate(2 minutes)",
+// });
+
+// new aws.cloudwatch.EventTarget("k3s-autoscaler-target", {
+//   rule: scheduleRule.name,
+//   arn: autoscalerFn.arn,
+// });
+
+// new aws.lambda.Permission("k3s-autoscaler-allow-eventbridge", {
+//   action: "lambda:InvokeFunction",
+//   function: autoscalerFn.name,
+//   principal: "events.amazonaws.com",
+//   sourceArn: scheduleRule.arn,
+// });
+
+const ddbEndpoint = new aws.ec2.VpcEndpoint("ddb-endpoint", {
+  vpcId: vpc.id,
+  serviceName: pulumi.interpolate`com.amazonaws.ap-southeast-1.dynamodb`,
+  vpcEndpointType: "Gateway",
+  routeTableIds: [publicRouteTable.id],
+});
+
+const ec2Endpoint = new aws.ec2.VpcEndpoint("ec2-endpoint", {
+  vpcId: vpc.id,
+  serviceName: pulumi.interpolate`com.amazonaws.ap-southeast-1.ec2`,
+  vpcEndpointType: "Interface",
+  subnetIds: [subnetA.id, subnetB.id],
+  securityGroupIds: [sgLambda.id],
+  privateDnsEnabled: true,
+});
+
+const ssmEndpoint = new aws.ec2.VpcEndpoint("ssm-endpoint", {
+  vpcId: vpc.id,
+  serviceName: pulumi.interpolate`com.amazonaws.ap-southeast-1.ssm`,
+  vpcEndpointType: "Interface",
+  subnetIds: [subnetA.id, subnetB.id],
+  securityGroupIds: [sgLambda.id],
+  privateDnsEnabled: true,
+});
+
+const ssmMessagesEndpoint = new aws.ec2.VpcEndpoint("ssm-messages-endpoint", {
+  vpcId: vpc.id,
+  serviceName: pulumi.interpolate`com.amazonaws.ap-southeast-1.ssmmessages`,
+  vpcEndpointType: "Interface",
+  subnetIds: [subnetA.id, subnetB.id],
+  securityGroupIds: [sgLambda.id],
+  privateDnsEnabled: true,
+});
+
+new aws.ec2.SecurityGroupRule("lambda-to-master-k3s-api", {
+  type: "ingress",
+  securityGroupId: sgMaster.id,
+  sourceSecurityGroupId: sgLambda.id,
+  protocol: "tcp",
+  fromPort: 6443,
+  toPort: 6443,
+  description: "Allow Lambda to call K3s API directly",
+});
 
 export const masterPublicIp = masterInstance.publicIp;
 export const masterPublicDns = masterInstance.publicDns;

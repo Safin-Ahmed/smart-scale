@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: pending-test
+  namespace: ecommerce
+spec:
+  replicas: 5
+  selector:
+    matchLabels:
+      app: pending-test
+  template:
+    metadata:
+      labels:
+        app: pending-test
+    spec:
+      containers:
+        - name: pause
+          image: registry.k8s.io/pause:3.9
+          resources:
+            requests:
+              cpu: "5000m"
+              memory: "8Gi"
+            limits:
+              cpu: "5000m"
+              memory: "8Gi"
