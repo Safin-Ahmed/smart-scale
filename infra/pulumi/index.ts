@@ -1,5 +1,8 @@
 import * as pulumi from "@pulumi/pulumi";
 import * as aws from "@pulumi/aws";
+import * as command from "@pulumi/command";
+
+import * as fs from "fs";
 
 // VPC CIDR + my ip for SSH
 const vpcCidr = "10.0.0.0/16";
@@ -10,6 +13,13 @@ const prometheusNodePort = 30900;
 
 // K3s cluster token
 const clusterToken = pulumi.interpolate`k3s-cluster-token-123456789`;
+const clusterTokenValue = pulumi.secret("k3s-cluster-token-123456789");
+
+const clusterTokenParam = new aws.ssm.Parameter("k3s-cluster-token-param", {
+  name: "/k3s-autoscaler/clusterToken",
+  type: "SecureString",
+  value: clusterTokenValue,
+});
 
 // AZs
 const azs = aws.getAvailabilityZones({ state: "available" });
@@ -202,6 +212,10 @@ export const promNodePort = prometheusNodePort;
 // PEM File Name For K3s Master EC2 Instance
 const keyName = "k3s_master_key_v5";
 
+const sshKey = pulumi.secret(
+  fs.readFileSync(`${process.env.HOME}/.aws/${keyName}.pem`, "utf-8")
+);
+
 const masterRole = new aws.iam.Role("k3s-master-role", {
   assumeRolePolicy: aws.iam.assumeRolePolicyForPrincipal({
     Service: "ec2.amazonaws.com",
@@ -249,6 +263,13 @@ curl -sfL https://get.k3s.io | sh -s - server \\
 sleep 5
 k3s kubectl get nodes || true
 
+MASTER_NODE="$(hostname)"
+# Label master so monitoring can be pinned here
+k3s kubectl label node "$MASTER_NODE" nodepool=monitoring --overwrite || true
+
+# Taint master so normal workloads don't land here
+k3s kubectl taint node "$MASTER_NODE" node-role.kubernetes.io/control-plane=true:NoSchedule --overwrite || true
+
 snap install amazon-ssm-agent --classic || true
 systemctl enable --now snap.amazon-ssm-agent.amazon-ssm-agent || true
 `;
@@ -266,6 +287,81 @@ const masterInstance = new aws.ec2.Instance("k3s-master", {
     Role: "k3s-control-plane",
     Cluster: "k3s-autoscaler",
   },
+});
+
+const autoScalerRbac = new command.remote.Command(
+  "autoscaler-rbac",
+  {
+    connection: {
+      host: masterInstance.publicIp,
+      user: "ubuntu",
+      privateKey: sshKey,
+    },
+    create: `
+set -euo pipefail
+for i in $(seq 1 60); do
+  if sudo k3s kubectl get nodes >/dev/null 2>&1; then break; fi
+  sleep 2
+done
+
+cat <<'EOF' | sudo k3s kubectl apply -f -
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: autoscaler
+  namespace: kube-system
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: autoscaler
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get","list","patch"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get","list"]
+  - apiGroups: ["policy"]
+    resources: ["pods/eviction"]
+    verbs: ["create"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: autoscaler
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: autoscaler
+subjects:
+  - kind: ServiceAccount
+    name: autoscaler
+    namespace: kube-system
+EOF
+`,
+  },
+  { dependsOn: masterInstance }
+);
+
+// Mint token (pick duration; if cluster caps it, it'll shorten)
+const autoscalerTokenCmd = new command.remote.Command(
+  "autoscaler-token",
+  {
+    connection: {
+      host: masterInstance.publicIp,
+      user: "ubuntu",
+      privateKey: sshKey,
+    },
+    create: `set -euo pipefail; sudo k3s kubectl -n kube-system create token autoscaler --duration=720h`,
+  },
+  { dependsOn: autoScalerRbac }
+);
+
+const apiTokenParam = new aws.ssm.Parameter("k3s-api-token-param", {
+  name: "/k3s-autoscaler/k8sApiToken",
+  type: "SecureString",
+  value: pulumi.secret(autoscalerTokenCmd.stdout),
 });
 
 const workerUserData = pulumi.interpolate`#!/bin/bash
@@ -426,6 +522,16 @@ new aws.iam.RolePolicy("k3s-autoscaler-policy", {
             ],
             Resource: "*",
           },
+          {
+            Effect: "Allow",
+            Action: ["ssm:GetParameter", "ssm:GetParameters"],
+            Resource: [apiTokenParam.arn, clusterTokenParam.arn],
+          },
+          {
+            Effect: "Allow",
+            Action: ["kms:Decrypt"],
+            Resource: "*",
+          },
         ],
       })
     ),
@@ -446,7 +552,7 @@ const autoscalerFn = new aws.lambda.Function("k3s-autoscaler", {
   role: autoscalerRole.arn,
   handler: "handler.handler",
   code: lambdaCode,
-  timeout: 120,
+  timeout: 600,
   memorySize: 256,
   environment: {
     variables: {
@@ -474,7 +580,8 @@ const autoscalerFn = new aws.lambda.Function("k3s-autoscaler", {
       WORKER_SUBNET_IDS: pulumi.interpolate`${subnetA.id},${subnetB.id}`,
       WORKER_SG_ID: sgWorker.id,
       WORKER_KEY_NAME: keyName,
-      K3S_TOKEN: clusterToken,
+      K3S_CLUSTER_TOKEN_PARAM: clusterTokenParam.name,
+      k8S_API_TOKEN_PARAM: apiTokenParam.name,
       WORKER_INSTANCE_PROFILE: masterInstanceProfile.name,
       PODS_PER_NODE: "10",
       MAX_BATCH_UP: "2",
@@ -486,21 +593,21 @@ const autoscalerFn = new aws.lambda.Function("k3s-autoscaler", {
   },
 });
 
-// const scheduleRule = new aws.cloudwatch.EventRule("k3s-autoscaler-every-2m", {
-//   scheduleExpression: "rate(2 minutes)",
-// });
+const scheduleRule = new aws.cloudwatch.EventRule("k3s-autoscaler-every-2m", {
+  scheduleExpression: "rate(2 minutes)",
+});
 
-// new aws.cloudwatch.EventTarget("k3s-autoscaler-target", {
-//   rule: scheduleRule.name,
-//   arn: autoscalerFn.arn,
-// });
+new aws.cloudwatch.EventTarget("k3s-autoscaler-target", {
+  rule: scheduleRule.name,
+  arn: autoscalerFn.arn,
+});
 
-// new aws.lambda.Permission("k3s-autoscaler-allow-eventbridge", {
-//   action: "lambda:InvokeFunction",
-//   function: autoscalerFn.name,
-//   principal: "events.amazonaws.com",
-//   sourceArn: scheduleRule.arn,
-// });
+new aws.lambda.Permission("k3s-autoscaler-allow-eventbridge", {
+  action: "lambda:InvokeFunction",
+  function: autoscalerFn.name,
+  principal: "events.amazonaws.com",
+  sourceArn: scheduleRule.arn,
+});
 
 const ddbEndpoint = new aws.ec2.VpcEndpoint("ddb-endpoint", {
   vpcId: vpc.id,

@@ -2,3 +2,35 @@ prometheus:
   service:
     type: NodePort
     nodePort: 30900
+  prometheusSpec:
+    nodeSelector:
+      nodepool: monitoring
+    tolerations:
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+
+alertmanager:
+  alertmanagerSpec:
+    nodeSelector:
+      nodepool: monitoring
+    tolerations:
+      - key: "node-role.kubernetes.io/control-plane"
+        operator: "Exists"
+        effect: "NoSchedule"
+
+grafana:
+  nodeSelector:
+    nodepool: monitoring
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"
+
+prometheusOperator:
+  nodeSelector:
+    nodepool: monitoring
+  tolerations:
+    - key: "node-role.kubernetes.io/control-plane"
+      operator: "Exists"
+      effect: "NoSchedule"

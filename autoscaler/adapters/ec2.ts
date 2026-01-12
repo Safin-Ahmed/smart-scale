@@ -1,6 +1,7 @@
 import {
   EC2Client,
   DescribeInstancesCommand,
+  DescribeSubnetsCommand,
   RunInstancesCommand,
   _InstanceType,
   TerminateInstancesCommand,
@@ -11,7 +12,15 @@ const ec2 = new EC2Client({});
 export async function listRunningWorkers(
   tagKey: string,
   tagValue: string
-): Promise<{ instanceId: string; launchTime: Date; privateIp: string }[]> {
+): Promise<
+  {
+    instanceId: string;
+    launchTime: Date;
+    privateIp: string;
+    availabilityZone: string;
+    subnetId: string;
+  }[]
+> {
   const out = await ec2.send(
     new DescribeInstancesCommand({
       Filters: [
@@ -21,7 +30,13 @@ export async function listRunningWorkers(
     })
   );
 
-  const ips: { instanceId: string; launchTime: Date; privateIp: string }[] = [];
+  const ips: {
+    instanceId: string;
+    launchTime: Date;
+    privateIp: string;
+    availabilityZone: string;
+    subnetId: string;
+  }[] = [];
 
   for (const r of out.Reservations ?? []) {
     for (const i of r.Instances ?? []) {
@@ -30,6 +45,8 @@ export async function listRunningWorkers(
           instanceId: i.InstanceId!,
           launchTime: i.LaunchTime!,
           privateIp: i.PrivateIpAddress,
+          availabilityZone: i.Placement?.AvailabilityZone!,
+          subnetId: i.SubnetId!,
         });
     }
   }
@@ -75,7 +92,12 @@ curl -sfL https://get.k3s.io | sh -s - agent
 `;
 }
 
-export async function launchWorkers(masterIp: string, count: number) {
+export async function launchWorkers(
+  masterIp: string,
+  count: number,
+  token: string,
+  opts?: { subnetId?: string }
+) {
   const amiId = process.env.WORKER_AMI_ID!;
   const instanceType = process.env.WORKER_INSTANCE_TYPE ?? "t3.medium";
   const subnetIds = (process.env.WORKER_SUBNET_IDS ?? "")
@@ -84,7 +106,6 @@ export async function launchWorkers(masterIp: string, count: number) {
     .filter(Boolean);
   const sgId = process.env.WORKER_SG_ID!;
   const keyName = process.env.WORKER_KEY_NAME!;
-  const token = process.env.K3S_TOKEN!;
   const profileName = process.env.WORKER_INSTANCE_PROFILE!;
   const clusterVal = process.env.CLUSTER_TAG_VALUE ?? "k3s-autoscaler";
 
@@ -98,7 +119,7 @@ export async function launchWorkers(masterIp: string, count: number) {
   const launched: string[] = [];
 
   for (let i = 0; i < count; i++) {
-    const subnetId = subnetIds[i % subnetIds.length];
+    const subnetId = opts?.subnetId ?? subnetIds[i % subnetIds.length];
 
     const res = await ec2.send(
       new RunInstancesCommand({
@@ -218,4 +239,23 @@ export async function terminateInstances(instanceIds: string[]): Promise<void> {
       InstanceIds: instanceIds,
     })
   );
+}
+
+export async function describeSubnetsAz(
+  subnetIds: string[]
+): Promise<{ subnetId: string; availabilityZone: string }[]> {
+  if (subnetIds.length === 0) return [];
+
+  const res = await ec2.send(
+    new DescribeSubnetsCommand({
+      SubnetIds: subnetIds,
+    })
+  );
+
+  return (res.Subnets ?? [])
+    .filter((s) => s.SubnetId && s.AvailabilityZone)
+    .map((s) => ({
+      subnetId: s.SubnetId!,
+      availabilityZone: s.AvailabilityZone!,
+    }));
 }

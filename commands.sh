@@ -100,3 +100,13 @@ aws dynamodb update-item \
   --expression-attribute-values '{":f":{"BOOL":false},":e":{"S":""},":z":{"N":"0"}}'
 
 curl -s "http://47.128.252.179:30900/api/v1/query?query=kube_state_metrics_build_info" | head -c 400
+
+
+
+# 1. Create the Service Account
+sudo k3s kubectl create serviceaccount lambda-autoscaler
+
+# 2. Bind it to the cluster-admin role
+sudo k3s kubectl create clusterrolebinding lambda-autoscaler-admin \
+  --clusterrole=cluster-admin \
+  --serviceaccount=default:lambda-autoscaler

@@ -10,6 +10,7 @@ import {
   getPrivateIpsForInstanceIds,
   findMasterInstanceId,
   terminateInstances,
+  describeSubnetsAz,
 } from "../adapters/ec2";
 import {
   beginScaleUp,
@@ -23,11 +24,18 @@ import {
 import { DynamoDbLockProvider } from "../adapters/dynamodbLock";
 import { writeLog } from "../adapters/logSink";
 import { runShellOnInstance } from "../adapters/ssm";
+import getSecureParam from "../adapters/ssm-parameter-store";
 
 export const handler = async (event: any, context: any) => {
   const tableName = mustEnv("STATE_TABLE");
   const lock = new DynamoDbLockProvider(tableName);
   const logsTable = mustEnv("LOGS_TABLE");
+
+  const apiTokenParamName = process.env.K8S_API_TOKEN_PARAM!;
+  const clusterTokenParamName = process.env.K3S_CLUSTER_TOKEN_PARAM!;
+
+  const k8sApiToken = await getSecureParam(apiTokenParamName);
+  const clusterToken = await getSecureParam(clusterTokenParamName);
 
   const now = Math.floor(Date.now() / 1000);
   const owner = context?.awsRequestId ?? `local=${now}`;
@@ -57,9 +65,10 @@ export const handler = async (event: any, context: any) => {
   let s = await loadState(tableName);
 
   // Determine Prometheus endpoint (pick a worker private ip)
-  const workerIp = await pickWorkerPrivateIp(workerTagKey, workerTagValue);
 
-  const prometheusBaseURL = `http://${workerIp}:${promNodePort}`;
+  const masterIp = await findMasterPrivateIp();
+
+  const prometheusBaseURL = `http://${masterIp}:${promNodePort}`;
 
   // PHASE 2: VERIFY JOIN MODE
   if (s.scalingInProgress && s.scaleUpActionId) {
@@ -242,9 +251,6 @@ export const handler = async (event: any, context: any) => {
     }
 
     // 1. Safety Check: Is the Master SSM/K8s responsive?
-    const masterIp = await findMasterPrivateIp();
-
-    const k8sToken = process.env.K8S_API_TOKEN;
 
     // Determine how many we can actually remove without dropping below minWorker
     const toRemoveCount = Math.min(
@@ -270,14 +276,14 @@ export const handler = async (event: any, context: any) => {
       };
 
     try {
-      // Sort workers by LaunchTime (Oldest First)
-      const sortedWorkers = runningWorkers.sort((a, b) => {
-        return (
-          new Date(a.launchTime).getTime() - new Date(b.launchTime).getTime()
-        );
-      });
+      const targets = pickScaleDownTargetsMultiAz(
+        runningWorkers,
+        toRemoveCount
+      );
 
-      const targets = sortedWorkers.slice(0, toRemoveCount);
+      const drainTimeout = 5 * 60 * 1000;
+
+      const terminated: string[] = [];
 
       for (const target of targets) {
         // Convert IP to k3s Node Name
@@ -285,28 +291,53 @@ export const handler = async (event: any, context: any) => {
 
         try {
           console.log(`Starting graceful drain for ${nodeName}`);
-          await gracefulDrain(masterIp, nodeName, k8sToken!);
+          const res = await gracefulDrain(
+            masterIp,
+            nodeName,
+            k8sApiToken,
+            drainTimeout
+          );
 
-          // ... call EC2 terminate command ...
+          await writeLog({
+            tableName: logsTable,
+            requestId: owner,
+            nowEpoch: now,
+            payload: {
+              phase: "scaleDownDrainResult",
+              nodeName,
+              instanceId: target.instanceId,
+              result: res,
+            },
+          });
+
+          if (!res.ok) {
+            return {
+              ok: true,
+              decision: { type: "NOOP", reason: `drainFailed: ${res.reason}` },
+            };
+          }
+
+          // Drain succeeded, terminate this instance
+          await terminateInstances([target.instanceId]);
+          terminated.push(target.instanceId);
         } catch (err: any) {
           console.error("Scale down failed:", err);
           return { ok: false, error: err.message };
         }
       }
 
-      // Terminate EC2s and update state
-      const targetIds = targets.map((t) => t.instanceId);
-      await terminateInstances(targetIds);
-      await recordScaleDown(tableName, now);
+      if (terminated.length > 0) {
+        await recordScaleDown(tableName, now);
+      }
 
       await writeLog({
         tableName: logsTable,
         requestId: owner,
         nowEpoch: now,
-        payload: { phase: "scaleDownSuccess", terminated: targetIds },
+        payload: { phase: "scaleDownSuccess", terminated },
       });
 
-      return { ok: true, decision, terminated: targetIds };
+      return { ok: true, decision, terminated };
     } catch (err) {
     } finally {
       await lock.release(decision.lockKey, owner, now, false);
@@ -382,7 +413,6 @@ export const handler = async (event: any, context: any) => {
 
   const actionId = `${now}-${owner}`;
   let launchedIds: string[] = [];
-  let masterIp = "";
 
   try {
     // Re-load state under lock
@@ -413,10 +443,68 @@ export const handler = async (event: any, context: any) => {
       requested: toLaunch,
     });
 
-    masterIp = await findMasterPrivateIp();
+    const subnetIds = (process.env.WORKER_SUBNET_IDS ?? "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean);
 
-    // Launch EC2 instances
-    launchedIds = await launchWorkers(masterIp, toLaunch);
+    const subnetAz = await describeSubnetsAz(subnetIds);
+
+    if (subnetAz.length === 0) {
+      throw new Error(
+        "No subnets returned from describeSubnetAz; check WORKER_SUBNET_IDS env"
+      );
+    }
+
+    // Build AZ -> [subnetIds]
+    const subnetsByAz = new Map<string, string[]>();
+    for (const s of subnetAz) {
+      subnetsByAz.set(s.availabilityZone, [
+        ...(subnetsByAz.get(s.availabilityZone) ?? []),
+        s.subnetId,
+      ]);
+    }
+
+    const currentWorkers = await listRunningWorkers(
+      workerTagKey,
+      workerTagValue
+    );
+
+    // Count current workers per AZ
+    const azCounts = new Map<string, number>();
+    for (const w of currentWorkers) {
+      azCounts.set(
+        w.availabilityZone,
+        (azCounts.get(w.availabilityZone) ?? 0) + 1
+      );
+    }
+
+    // Launch one-by-one into least-filled AZ
+    launchedIds = [];
+    const chosen: { az: string; subnetId: string }[] = [];
+    for (let i = 0; i < toLaunch; i++) {
+      const candidateAzs = [...subnetsByAz.keys()];
+      candidateAzs.sort(
+        (a, b) => (azCounts.get(a) ?? 0) - (azCounts.get(b) ?? 0)
+      );
+
+      const chosenAz = candidateAzs[0];
+      const azSubnets = subnetsByAz.get(chosenAz)!;
+
+      if (!azSubnets || azSubnets.length === 0) {
+        throw new Error(`No subnets found for chosen AZ ${chosenAz}`);
+      }
+
+      const chosenSubnet = azSubnets[i % azSubnets?.length];
+
+      const ids = await launchWorkers(masterIp, 1, clusterToken, {
+        subnetId: chosenSubnet,
+      });
+
+      launchedIds.push(...ids);
+      chosen.push({ az: chosenAz, subnetId: chosenSubnet });
+      azCounts.set(chosenAz, (azCounts.get(chosenAz) ?? 0) + 1);
+    }
 
     await recordScaleUpInstances({
       tableName,
@@ -434,6 +522,7 @@ export const handler = async (event: any, context: any) => {
         launchedInstanceIds: launchedIds,
         toLaunch,
         masterPrivateIp: masterIp,
+        azPlan: chosen,
       },
     });
 
@@ -506,20 +595,86 @@ function mustEnv(k: string): string {
   return v;
 }
 
-async function gracefulDrain(
-  masterIp: string,
-  nodeName: string,
-  token: string
-) {
-  const k8sApi = axios.create({
-    httpsAgent: new https.Agent({ rejectUnauthorized: false }), // Ignore self-signed certs
-  });
-  const baseUrl = `https://${masterIp}:6443`;
-  const headers = { Authorization: `Bearer ${token}` };
+type DrainResult = {
+  ok: boolean;
+  reason: string;
+  startedAt: number;
+  finishedAt: number;
+  evicted: { ns: string; name: string }[];
+  remaining: { ns: string; name: string; kind?: string }[];
+};
 
-  // 1. Cordon
+const CRITICAL_PRIORITY_CLASSES = new Set([
+  "system-node-critical",
+  "system-cluster-critical",
+]);
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isDaemonSetPod(pod: any): boolean {
+  return !!pod.metadata?.ownerReferences?.some(
+    (r: any) => r.kind === "DaemonSet"
+  );
+}
+
+function isMirrorStaticPod(pod: any): boolean {
+  return !!pod.metadata?.annotations?.["kubernetes.io/config.mirror"];
+}
+
+function isCriticalSystemPod(pod: any): boolean {
+  const ns = pod.metadata?.namespace;
+  const pc = pod.spec?.priorityClassName;
+
+  if (CRITICAL_PRIORITY_CLASSES.has(pc)) return true;
+
+  // kube-system pods that are NOT daemonsets are treated as critical for scale-down safety
+  if (ns === "kube-system" && !isDaemonSetPod(pod)) return true;
+
+  // Mirror/static pods are managed outside the API; draining them is not what you want.
+  if (isMirrorStaticPod(pod)) return true;
+
+  return false;
+}
+
+function isEvictablePod(pod: any): boolean {
+  // Do not evict DaemonSet pods
+  if (isDaemonSetPod(pod)) return false;
+
+  // Do not try to evict mirror/static pods
+  if (isMirrorStaticPod(pod)) return false;
+
+  // Also ignore succeeded/failed pods
+  const phase = pod.status?.phase;
+  if (phase === "Succeeded" || phase === "Failed") return false;
+
+  return true;
+}
+
+async function listPodsOnNode(
+  k8sApi: any,
+  baseUrl: string,
+  headers: any,
+  nodeName: string
+) {
+  const podsRes = await k8sApi.get(
+    `${baseUrl}/api/v1/pods?fieldSelector=spec.nodeName=${encodeURIComponent(
+      nodeName
+    )}`,
+    { headers }
+  );
+  return podsRes.data.items ?? [];
+}
+
+async function cordonNode(
+  k8sApi: any,
+  baseUrl: string,
+  headers: any,
+  nodeName: string
+) {
   await k8sApi.patch(
-    `${baseUrl}/api/v1/nodes/${nodeName}`,
+    `${baseUrl}/api/v1/nodes/${encodeURIComponent(nodeName)}`,
     { spec: { unschedulable: true } },
     {
       headers: {
@@ -528,78 +683,226 @@ async function gracefulDrain(
       },
     }
   );
-
-  // 2. Evict
-  const podsRes = await k8sApi.get(
-    `${baseUrl}/api/v1/pods?fieldSelector=spec.nodeName=${nodeName}`,
-    { headers }
-  );
-  for (const pod of podsRes.data.items) {
-    if (
-      pod.metadata.ownerReferences?.some((ref: any) => ref.kind === "DaemonSet")
-    )
-      continue;
-
-    await k8sApi.post(
-      `${baseUrl}/api/v1/namespaces/${pod.metadata.namespace}/pods/${pod.metadata.name}/eviction`,
-      {
-        apiVersion: "policy/v1",
-        kind: "Eviction",
-        metadata: { name: pod.metadata.name },
-      },
-      { headers }
-    );
-  }
-
-  // 3. Grace period
-  await new Promise((r) => setTimeout(r, 30000));
 }
 
-// async function verifyWorkersReadyViaSsm(instanceIds: string[]) {
-//   // 1. Find Private IPs for those instances
-//   const pairs = await getPrivateIpsForInstanceIds(instanceIds);
-//   const wantedIps = pairs.map((p) => p.ip);
+async function evictPod(k8sApi: any, baseUrl: string, headers: any, pod: any) {
+  const ns = pod.metadata.namespace;
+  const name = pod.metadata.name;
 
-//   // 2. Run kubectl on master via SSM
-//   const masterInstanceId = await findMasterInstanceId();
+  // policy/v1 eviction endpoint
+  return k8sApi.post(
+    `${baseUrl}/api/v1/namespaces/${encodeURIComponent(
+      ns
+    )}/pods/${encodeURIComponent(name)}/eviction`,
+    {
+      apiVersion: "policy/v1",
+      kind: "Eviction",
+      metadata: { name, namespace: ns },
+    },
+    { headers }
+  );
+}
 
-//   const cmd =
-//     `k3s kubectl get nodes -o jsonpath='{range .items[*]}` +
-//     `{.status.addresses[?(@.type=="InternalIP")].address}{" "}` +
-//     `{.status.conditions[?(@.type=="Ready")].status}{"\\n"}` +
-//     `{end}'`;
+/**
+ * Requirement-compliant drain:
+ * - cordon
+ * - abort if critical system pods exist
+ * - attempt eviction until only non-evictable pods remain
+ * - hard stop at 5 minutes
+ */
+export async function gracefulDrain(
+  masterIp: string,
+  nodeName: string,
+  token: string,
+  drainTimeoutMs = 5 * 60 * 1000
+): Promise<DrainResult> {
+  const startedAt = Date.now();
 
-//   const res = await runShellOnInstance({
-//     instanceId: masterInstanceId,
-//     commands: [cmd],
-//     timeoutSeconds: 55,
-//   });
+  const k8sApi = axios.create({
+    httpsAgent: new https.Agent({ rejectUnauthorized: false }),
+    timeout: 15_000, // per-request, not overall drain
+  });
 
-//   if (res.status !== "Success") {
-//     throw new Error(
-//       `SSM kubectl failed: status=${res.status} stderr=${res.stderr}`
-//     );
-//   }
+  const baseUrl = `https://${masterIp}:6443`;
+  const headers = { Authorization: `Bearer ${token}` };
 
-//   // parse: "10.0.1.45 True"
-//   const readyIps = new Set<string>();
-//   for (const line of res.stdout.split("\n")) {
-//     const t = line.trim();
+  // 1) Cordon first
+  await cordonNode(k8sApi, baseUrl, headers, nodeName);
 
-//     if (!t) continue;
+  // 2) Pre-check critical pods
+  const initialPods = await listPodsOnNode(k8sApi, baseUrl, headers, nodeName);
+  const critical = initialPods.filter(isCriticalSystemPod);
+  if (critical.length > 0) {
+    return {
+      ok: false,
+      reason: `criticalSystemPodsPresent(${critical
+        .map((p: any) => `${p.metadata.namespace}/${p.metadata.name}`)
+        .join(",")})`,
+      startedAt,
+      finishedAt: Date.now(),
+      evicted: [],
+      remaining: critical.map((p: any) => ({
+        ns: p.metadata.namespace,
+        name: p.metadata.name,
+        kind: p.metadata.ownerReferences?.[0]?.kind,
+      })),
+    };
+  }
 
-//     const [ip, ready] = t.split(/\s+/);
-//     if (ip && ready === "True") readyIps.add(ip);
-//   }
+  const deadline = startedAt + drainTimeoutMs;
+  const evicted: { ns: string; name: string }[] = [];
 
-//   const missingIps = wantedIps.filter((ip) => !readyIps.has(ip));
+  // 3) Eviction loop until drained or timeout
+  // Backoff helps with API pressure and gives controllers time to reschedule
+  let backoffMs = 500;
 
-//   return {
-//     masterInstanceId,
-//     instanceIds,
-//     wantedIps,
-//     readyIps: Array.from(readyIps),
-//     missingIps,
-//     raw: res.stdout.trim(),
-//   };
-// }
+  while (Date.now() < deadline) {
+    const pods = await listPodsOnNode(k8sApi, baseUrl, headers, nodeName);
+
+    // If critical pods appear mid-drain, abort (rare but possible)
+    const newlyCritical = pods.filter(isCriticalSystemPod);
+    if (newlyCritical.length > 0) {
+      return {
+        ok: false,
+        reason: `criticalSystemPodsAppeared(${newlyCritical
+          .map((p: any) => `${p.metadata.namespace}/${p.metadata.name}`)
+          .join(",")})`,
+        startedAt,
+        finishedAt: Date.now(),
+        evicted,
+        remaining: newlyCritical.map((p: any) => ({
+          ns: p.metadata.namespace,
+          name: p.metadata.name,
+        })),
+      };
+    }
+
+    const evictable = pods.filter(isEvictablePod);
+
+    // Drain done: only DaemonSets/mirror/completed pods remain
+    if (evictable.length === 0) {
+      return {
+        ok: true,
+        reason: "drained",
+        startedAt,
+        finishedAt: Date.now(),
+        evicted,
+        remaining: [],
+      };
+    }
+
+    // Try evict evictable pods
+    for (const pod of evictable) {
+      // Stop early if time is up
+      if (Date.now() >= deadline) break;
+
+      const ns = pod.metadata.namespace;
+      const name = pod.metadata.name;
+
+      try {
+        await evictPod(k8sApi, baseUrl, headers, pod);
+        evicted.push({ ns, name });
+      } catch (err: any) {
+        const status = err?.response?.status;
+        const msg = err?.response?.data
+          ? JSON.stringify(err.response.data)
+          : String(err);
+
+        // 429 is typical when a PDB blocks eviction (or too many requests)
+        if (status === 429) {
+          return {
+            ok: false,
+            reason: `pdbOrEvictionBlocked(429) on ${ns}/${name}: ${msg}`,
+            startedAt,
+            finishedAt: Date.now(),
+            evicted,
+            remaining: [{ ns, name }],
+          };
+        }
+
+        // 404 means it disappeared between list and eviction; ignore
+        if (status === 404) continue;
+
+        // Anything else is real failure
+        return {
+          ok: false,
+          reason: `evictionFailed(${
+            status ?? "unknown"
+          }) on ${ns}/${name}: ${msg}`,
+          startedAt,
+          finishedAt: Date.now(),
+          evicted,
+          remaining: [{ ns, name }],
+        };
+      }
+    }
+
+    await sleep(backoffMs);
+    backoffMs = Math.min(backoffMs * 2, 5000);
+  }
+
+  // 4) Timeout: must not terminate
+  const podsLeft = await listPodsOnNode(k8sApi, baseUrl, headers, nodeName);
+  const remaining = podsLeft
+    .filter(isEvictablePod)
+    .map((p: any) => ({ ns: p.metadata.namespace, name: p.metadata.name }));
+
+  return {
+    ok: false,
+    reason: `drainTimeout(${Math.floor(drainTimeoutMs / 1000)}s)`,
+    startedAt,
+    finishedAt: Date.now(),
+    evicted,
+    remaining,
+  };
+}
+
+function pickScaleDownTargetsMultiAz(
+  workers: {
+    availabilityZone: string;
+    launchTime: Date;
+  }[],
+  toRemoveCount: number
+) {
+  const byAz = new Map<string, any[]>();
+
+  for (const w of workers) {
+    byAz.set(w.availabilityZone, [...(byAz.get(w.availabilityZone) ?? []), w]);
+  }
+
+  // Sort each AZ bucket by oldest first
+  for (const [az, list] of byAz.entries()) {
+    list.sort(
+      (a, b) =>
+        new Date(a.launchTime).getTime() - new Date(b.launchTime).getTime()
+    );
+    byAz.set(az, list);
+  }
+
+  const targets: any[] = [];
+  const azCount = byAz.size;
+
+  while (targets.length < toRemoveCount) {
+    const azs = [...byAz.keys()];
+    azs.sort((a, b) => byAz.get(b)!.length - byAz.get(a)!.length);
+
+    const chosenAz = azs[0];
+
+    const list = byAz.get(chosenAz)!;
+
+    if (list?.length === 0) break;
+
+    // if we have multiple AZs, avoid taking an AZ to zero if possible
+    if (azCount >= 2 && list.length <= 1) {
+      // try next AZ
+      const nextAz = azs.find((az) => (byAz.get(az)?.length ?? 0) > 1);
+      if (!nextAz) break;
+      targets.push(byAz.get(nextAz)!.shift());
+      continue;
+    }
+
+    targets.push(list?.shift());
+  }
+
+  return targets;
+}
