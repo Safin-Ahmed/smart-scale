@@ -180,13 +180,17 @@ K3S-AUTOSCALER
 ├── autoscaler/
 │ ├── adapters/
 │ ├── core/
-│ └── handler.ts
+│ └── lambda/handler.ts
 ├── infra/
 │ ├── pulumi/
 │ └── k8s/
 ├── docs/
+| ├── architecture
+| ├── scaling-algorithm
+| ├── design
 │ ├── component-specifications/
 │ ├── monitoring-and-alerting/
+| ├── testing-strategy
 │ └── bonus/
 └── README.md
 
