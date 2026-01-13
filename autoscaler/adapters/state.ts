@@ -18,6 +18,12 @@ export type StateRecord = {
   scaleUpActionId?: string;
   scaleUpStartedEpoch?: number;
   scaleUpInstanceIds?: string[];
+
+  scaleDownActionId?: string;
+  scaleDownStartedEpoch?: number;
+  scaleDownPhase?: "DRAINING" | "TERMINATING";
+  scaleDownTargetInstanceIds?: string[];
+  scaleDownCompletedInstanceIds?: string[];
 };
 
 export async function ensureState(tableName: string): Promise<void> {
@@ -35,6 +41,8 @@ export async function ensureState(tableName: string): Promise<void> {
           workerCount: { N: "0" },
           scaleUpStartedEpoch: { N: "0" },
           scaleUpInstanceIds: { L: [] },
+          scaleDownTargetInstanceIds: { L: [] },
+          scaleDownCompletedInstanceIds: { L: [] },
         },
         ConditionExpression: "attribute_not_exists(pk)",
       })
@@ -60,6 +68,16 @@ export async function loadState(tableName: string): Promise<StateRecord> {
     Boolean
   ) as string[] | undefined;
 
+  const sdTargets = it.scaleDownTargetInstanceIds?.L?.map((x) => x.S).filter(
+    Boolean
+  ) as string[] | undefined;
+
+  const sdDone = it.scaleDownCompletedInstanceIds?.L?.map((x) => x.S).filter(
+    Boolean
+  ) as string[] | undefined;
+
+  const sdPhase = it.scaleDownPhase?.S as any;
+
   return {
     scalingInProgress: it.scalingInProgress?.BOOL ?? false,
     lastScaleEpoch: Number(it.lastScaleEpoch?.N ?? "0"),
@@ -72,6 +90,14 @@ export async function loadState(tableName: string): Promise<StateRecord> {
       : undefined,
     scaleUpInstanceIds:
       instanceIds && instanceIds.length ? instanceIds : undefined,
+    scaleDownActionId: it.scaleDownActionId?.S,
+    scaleDownStartedEpoch: it.scaleDownStartedEpoch
+      ? Number(it.scaleDownStartedEpoch.N ?? "0")
+      : undefined,
+    scaleDownPhase: sdPhase,
+    scaleDownTargetInstanceIds:
+      sdTargets && sdTargets.length ? sdTargets : undefined,
+    scaleDownCompletedInstanceIds: sdDone && sdDone.length ? sdDone : undefined,
   };
 }
 
@@ -197,6 +223,102 @@ export async function failScaleUp(params: {
       UpdateExpression:
         "SET scalingInProgress=:f REMOVE scaleUpActionId, scaleUpStartedEpoch, scaleUpRequested, scaleUpInstanceIds",
       ConditionExpression: "scaleUpActionId=:aid",
+      ExpressionAttributeValues: {
+        ":f": { BOOL: false },
+        ":aid": { S: actionId },
+      },
+    })
+  );
+}
+
+export async function beginScaleDown(params: {
+  tableName: string;
+  nowEpoch: number;
+  actionId: string;
+  targetInstanceIds: string[];
+}) {
+  const { tableName, nowEpoch, actionId, targetInstanceIds } = params;
+
+  await ddb.send(
+    new UpdateItemCommand({
+      TableName: tableName,
+      Key: { pk: { S: "cluster" } },
+      UpdateExpression:
+        "SET scalingInProgress=:t, scaleDownActionId=:aid, scaleDownStartedEpoch=:now, scaleDownPhase=:ph, scaleDownTargetInstanceIds=:targets, scaleDownCompletedInstanceIds=:empty",
+      ConditionExpression:
+        "attribute_not_exists(scalingInProgress) OR scalingInProgress=:f",
+      ExpressionAttributeValues: {
+        ":t": { BOOL: true },
+        ":f": { BOOL: false },
+        ":aid": { S: actionId },
+        ":now": { N: String(nowEpoch) },
+        ":ph": { S: "DRAINING" },
+        ":targets": { L: targetInstanceIds.map((id) => ({ S: id })) },
+        ":empty": { L: [] },
+      },
+    })
+  );
+}
+
+export async function markScaleDownInstanceDone(params: {
+  tableName: string;
+  actionId: string;
+  instanceId: string;
+}) {
+  const { tableName, actionId, instanceId } = params;
+
+  await ddb.send(
+    new UpdateItemCommand({
+      TableName: tableName,
+      Key: { pk: { S: "cluster" } },
+      UpdateExpression:
+        "SET scaleDownCompletedInstanceIds = list_append(if_not_exists(scaleDownCompletedInstanceIds, :empty), :one)",
+      ConditionExpression: "scaleDownActionId=:aid",
+      ExpressionAttributeValues: {
+        ":aid": { S: actionId },
+        ":empty": { L: [] },
+        ":one": { L: [{ S: instanceId }] },
+      },
+    })
+  );
+}
+
+export async function completeScaleDown(params: {
+  tableName: string;
+  actionId: string;
+  nowEpoch: number;
+}) {
+  const { tableName, actionId, nowEpoch } = params;
+
+  await ddb.send(
+    new UpdateItemCommand({
+      TableName: tableName,
+      Key: { pk: { S: "cluster" } },
+      UpdateExpression:
+        "SET scalingInProgress=:f, lastScaleEpoch=:now REMOVE scaleDownActionId, scaleDownStartedEpoch, scaleDownPhase, scaleDownTargetInstanceIds, scaleDownCompletedInstanceIds",
+      ConditionExpression: "scaleDownActionId=:aid",
+      ExpressionAttributeValues: {
+        ":f": { BOOL: false },
+        ":now": { N: String(nowEpoch) },
+        ":aid": { S: actionId },
+      },
+    })
+  );
+}
+
+export async function failScaleDown(params: {
+  tableName: string;
+  actionId: string;
+}) {
+  const { tableName, actionId } = params;
+
+  await ddb.send(
+    new UpdateItemCommand({
+      TableName: tableName,
+      Key: { pk: { S: "cluster" } },
+      UpdateExpression:
+        "SET scalingInProgress=:f REMOVE scaleDownActionId, scaleDownStartedEpoch, scaleDownPhase, scaleDownTargetInstanceIds, scaleDownCompletedInstanceIds",
+      ConditionExpression: "scaleDownActionId=:aid",
       ExpressionAttributeValues: {
         ":f": { BOOL: false },
         ":aid": { S: actionId },

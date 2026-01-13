@@ -3,12 +3,10 @@ import { getMetrics, getReadyNodeIps } from "../adapters/prometheus";
 import axios from "axios";
 import * as https from "https";
 import {
-  pickWorkerPrivateIp,
   listRunningWorkers,
   findMasterPrivateIp,
   launchWorkers,
   getPrivateIpsForInstanceIds,
-  findMasterInstanceId,
   terminateInstances,
   describeSubnetsAz,
 } from "../adapters/ec2";
@@ -18,8 +16,11 @@ import {
   ensureState,
   failScaleUp,
   loadState,
-  recordScaleDown,
   recordScaleUpInstances,
+  beginScaleDown,
+  markScaleDownInstanceDone,
+  completeScaleDown,
+  failScaleDown,
 } from "../adapters/state";
 import { DynamoDbLockProvider } from "../adapters/dynamodbLock";
 import { writeLog } from "../adapters/logSink";
@@ -39,10 +40,31 @@ export const handler = async (event: any, context: any) => {
 
   const now = Math.floor(Date.now() / 1000);
   const owner = context?.awsRequestId ?? `local=${now}`;
+
   const promNodePort = process.env.PROM_NODEPORT ?? "30900";
 
   const workerTagKey = process.env.WORKER_TAG_KEY ?? "Role";
   const workerTagValue = process.env.WORKER_TAG_VALUE ?? "k3s-worker";
+
+  const detailType = event?.["detail-type"];
+
+  if (
+    detailType === "EC2 Spot Instance Interruption Warning" ||
+    detailType === "EC2 Instance Rebalance Recommendation"
+  ) {
+    return await handleSpotEvent(event, {
+      tableName,
+      logsTable,
+      lock,
+      owner,
+      now,
+      k8sApiToken,
+      clusterToken,
+      workerTagKey,
+      workerTagValue,
+      promNodePort,
+    });
+  }
 
   const cfg: AutoScalerConfig = {
     cpuScaleUpThreshold: Number(process.env.CPU_UP ?? "0.70"),
@@ -183,6 +205,19 @@ export const handler = async (event: any, context: any) => {
     };
   }
 
+  if (s.scalingInProgress && s.scaleDownActionId) {
+    return await resumeScaleDown({
+      tableName,
+      logsTable,
+      lock,
+      owner,
+      now,
+      masterIp,
+      k8sApiToken,
+      state: s,
+    });
+  }
+
   // Metrics
 
   const { avgCpu, pendingPods, pendingLongEnough, idleLongEnough } =
@@ -264,6 +299,7 @@ export const handler = async (event: any, context: any) => {
         decision: { type: "NOOP", reason: "minWorkersReached" },
       };
 
+    const actionId = `sd-${now}-${owner}`;
     const acquired = await lock.acquire(decision.lockKey, owner, now, 300);
 
     if (!acquired)
@@ -281,11 +317,27 @@ export const handler = async (event: any, context: any) => {
         toRemoveCount
       );
 
+      const targetIds = targets.map((t) => t.instanceId);
+
+      // Persist intent BEFORE touching the cluster
+      await beginScaleDown({
+        tableName,
+        nowEpoch: now,
+        actionId,
+        targetInstanceIds: targetIds,
+      });
+
+      s = await loadState(tableName);
+
+      const completed = new Set(s.scaleDownCompletedInstanceIds ?? []);
+
       const drainTimeout = 5 * 60 * 1000;
 
       const terminated: string[] = [];
 
       for (const target of targets) {
+        if (completed.has(target.instanceId)) continue;
+
         // Convert IP to k3s Node Name
         const nodeName = `ip-${target.privateIp.replace(/\./g, "-")}`;
 
@@ -320,15 +372,22 @@ export const handler = async (event: any, context: any) => {
           // Drain succeeded, terminate this instance
           await terminateInstances([target.instanceId]);
           terminated.push(target.instanceId);
+          await markScaleDownInstanceDone({
+            tableName,
+            actionId,
+            instanceId: target.instanceId,
+          });
         } catch (err: any) {
           console.error("Scale down failed:", err);
           return { ok: false, error: err.message };
         }
       }
 
-      if (terminated.length > 0) {
-        await recordScaleDown(tableName, now);
-      }
+      await completeScaleDown({
+        tableName,
+        actionId,
+        nowEpoch: now,
+      });
 
       await writeLog({
         tableName: logsTable,
@@ -495,11 +554,19 @@ export const handler = async (event: any, context: any) => {
         throw new Error(`No subnets found for chosen AZ ${chosenAz}`);
       }
 
-      const chosenSubnet = azSubnets[i % azSubnets?.length];
-
-      const ids = await launchWorkers(masterIp, 1, clusterToken, {
-        subnetId: chosenSubnet,
-      });
+      const chosenSubnet = azSubnets[i % azSubnets.length];
+      let ids: string[] = [];
+      try {
+        ids = await launchWorkers(masterIp, 1, clusterToken, {
+          subnetId: chosenSubnet,
+          marketType: "spot",
+        });
+      } catch (error) {
+        ids = await launchWorkers(masterIp, 1, clusterToken, {
+          subnetId: chosenSubnet,
+          marketType: "on-demand",
+        });
+      }
 
       launchedIds.push(...ids);
       chosen.push({ az: chosenAz, subnetId: chosenSubnet });
@@ -905,4 +972,295 @@ function pickScaleDownTargetsMultiAz(
   }
 
   return targets;
+}
+
+async function handleSpotEvent(
+  event: any,
+  ctx: {
+    tableName: string;
+    logsTable: string;
+    lock: DynamoDbLockProvider;
+    owner: string;
+    now: number;
+    k8sApiToken: string;
+    clusterToken: string;
+    workerTagKey: string;
+    workerTagValue: string;
+    promNodePort: string;
+  }
+) {
+  const instanceId = event?.detail?.["instance-id"];
+  const detailType = event?.["detail-type"] ?? "unknown";
+
+  if (!instanceId) {
+    return {
+      ok: true,
+      decision: { type: "NOOP", reason: "spotEventMissingInstanceId" },
+    };
+  }
+
+  const lockKey = `spot:${instanceId}`;
+
+  const acquired = await ctx.lock.acquire(lockKey, ctx.owner, ctx.now, 180);
+
+  if (!acquired) {
+    return { ok: true, decision: { type: "NOOP", reason: "spotLockHeld" } };
+  }
+
+  try {
+    const masterIp = await findMasterPrivateIp();
+
+    // Find private IP -> nodeName
+    const pairs = await getPrivateIpsForInstanceIds([instanceId]);
+
+    const ip = pairs[0]?.ip;
+
+    if (!ip) {
+      await writeLog({
+        tableName: ctx.logsTable,
+        requestId: ctx.owner,
+        nowEpoch: ctx.now,
+        payload: { phase: "spotEventNoPrivateIp", instanceId, detailType },
+      });
+
+      // Still try to replace capacity
+      await launchReplacementWorker(masterIp, ctx);
+      return {
+        ok: true,
+        decision: { type: "NOOP", reason: "spotEventNoPrivateIpReplaced" },
+      };
+    }
+
+    const nodeName = `ip-${ip.replace(/\./g, "-")}`;
+
+    // Tight timeout: spot gives ~2 minutes
+    const drainTimeoutMs = 110_000;
+
+    const drainRes = await gracefulDrain(
+      masterIp,
+      nodeName,
+      ctx.k8sApiToken,
+      drainTimeoutMs
+    );
+
+    await writeLog({
+      tableName: ctx.logsTable,
+      requestId: ctx.owner,
+      nowEpoch: ctx.now,
+      payload: {
+        phase: "spotInterruptionHandled",
+        detailType,
+        instanceId,
+        nodeName,
+        drainRes,
+      },
+    });
+
+    // Terminate proactively
+    try {
+      await terminateInstances([instanceId]);
+    } catch {}
+
+    // Replace capacity immediately (AZ-aware, spot-first, fallback)
+    await launchReplacementWorker(masterIp, ctx);
+
+    return { ok: true, decision: { type: "NOOP", reason: "spotHandled" } };
+  } catch (error) {
+    await writeLog({
+      tableName: ctx.logsTable,
+      requestId: ctx.owner,
+      nowEpoch: ctx.now,
+      payload: {
+        phase: "spotInterruptionError",
+        error: String(error),
+        instanceId,
+        detailType,
+      },
+    });
+
+    return { ok: false, error: String(error) };
+  } finally {
+    await ctx.lock.release(lockKey, ctx.owner, ctx.now, false);
+  }
+}
+
+async function launchReplacementWorker(
+  masterIp: string,
+  ctx: {
+    clusterToken: string;
+    workerTagKey: string;
+    workerTagValue: string;
+    logsTable: string;
+    owner: string;
+    now: number;
+  }
+) {
+  const runningWorkers = await listRunningWorkers(
+    ctx.workerTagKey,
+    ctx.workerTagValue
+  );
+
+  const subnetIds = (process.env.WORKER_SUBNET_IDS ?? "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const subnetAz = await describeSubnetsAz(subnetIds);
+
+  const subnetByAz = new Map<string, string[]>();
+
+  for (const s of subnetAz) {
+    subnetByAz.set(s.availabilityZone, [
+      ...(subnetByAz.get(s.availabilityZone) ?? []),
+      s.subnetId,
+    ]);
+  }
+
+  if (subnetByAz.size === 0) {
+    throw new Error("No subnet Azs available for replacement launch");
+  }
+
+  // Count current workers per AZ
+  const azCounts = new Map<string, number>();
+  for (const w of runningWorkers) {
+    azCounts.set(
+      w.availabilityZone,
+      (azCounts.get(w.availabilityZone) ?? 0) + 1
+    );
+  }
+
+  // Choose least-filled AZ
+  const candidateAzs = [...subnetByAz.keys()];
+  candidateAzs.sort((a, b) => (azCounts.get(a) ?? 0) - (azCounts.get(b) ?? 0));
+  const chosenAz = candidateAzs[0];
+
+  const azSubnets = subnetByAz.get(chosenAz)!;
+  if (azSubnets.length === 0)
+    throw new Error(`No subnets in chosen AZ ${chosenAz}`);
+
+  const chosenSubnet = azSubnets[0];
+
+  // Sport first with fallback
+
+  try {
+    const ids = await launchWorkers(masterIp, 1, ctx.clusterToken, {
+      subnetId: chosenSubnet,
+      marketType: "spot",
+    });
+
+    await writeLog({
+      tableName: ctx.logsTable,
+      requestId: ctx.owner,
+      nowEpoch: ctx.now,
+      payload: {
+        phase: "spotReplacementLaunched",
+        market: "spot",
+        chosenAz,
+        chosenSubnet,
+        ids,
+      },
+    });
+
+    return ids;
+  } catch (error: any) {
+    const ids = await launchWorkers(masterIp, 1, ctx.clusterToken, {
+      subnetId: chosenSubnet,
+      marketType: "on-demand",
+    });
+
+    await writeLog({
+      tableName: ctx.logsTable,
+      requestId: ctx.owner,
+      nowEpoch: ctx.now,
+      payload: {
+        phase: "spotReplacementLaunched",
+        market: "on-demand",
+        chosenAz,
+        chosenSubnet,
+        ids,
+        reason: String(error),
+      },
+    });
+  }
+}
+
+async function resumeScaleDown(params: {
+  tableName: string;
+  logsTable: string;
+  lock: DynamoDbLockProvider;
+  owner: string;
+  now: number;
+  masterIp: string;
+  k8sApiToken: string;
+  state: any;
+}) {
+  const {
+    tableName,
+    logsTable,
+    lock,
+    owner,
+    now,
+    masterIp,
+    k8sApiToken,
+    state,
+  } = params;
+
+  if (
+    state.scaleDownStartedEpoch &&
+    now - state.scaleDownStartedEpoch > 900 // 15 minutes
+  ) {
+    await failScaleDown({
+      tableName,
+      actionId: state.scaleDownActionId!,
+    });
+    return {
+      ok: true,
+      decision: { type: "NOOP", reason: "scaleDownTimedOut" },
+    };
+  }
+
+  const acquired = await lock.acquire("cluster", owner, now, 300);
+  if (!acquired)
+    return { ok: true, decision: { type: "NOOP", reason: "scaleDownLocked" } };
+
+  try {
+    const completed = new Set(state.scaleDownCompletedInstanceIds ?? []);
+    const targets = state.scaleDownTargetInstanceIds ?? [];
+
+    for (const instanceId of targets) {
+      if (completed.has(instanceId)) continue;
+
+      const pairs = await getPrivateIpsForInstanceIds([instanceId]);
+      const ip = pairs[0]?.ip;
+      if (!ip) continue;
+
+      const nodeName = `ip-${ip.replace(/\./g, "-")}`;
+      const res = await gracefulDrain(
+        masterIp,
+        nodeName,
+        k8sApiToken,
+        5 * 60 * 1000
+      );
+
+      if (!res.ok)
+        return { ok: true, decision: { type: "NOOP", reason: res.reason } };
+
+      await terminateInstances([instanceId]);
+      await markScaleDownInstanceDone({
+        tableName,
+        actionId: state.scaleDownActionId!,
+        instanceId,
+      });
+    }
+
+    await completeScaleDown({
+      tableName,
+      actionId: state.scaleDownActionId!,
+      nowEpoch: now,
+    });
+
+    return { ok: true, decision: { type: "NOOP", reason: "scaleDownResumed" } };
+  } finally {
+    await lock.release("cluster", owner, now, false);
+  }
 }

@@ -581,7 +581,7 @@ const autoscalerFn = new aws.lambda.Function("k3s-autoscaler", {
       WORKER_SG_ID: sgWorker.id,
       WORKER_KEY_NAME: keyName,
       K3S_CLUSTER_TOKEN_PARAM: clusterTokenParam.name,
-      k8S_API_TOKEN_PARAM: apiTokenParam.name,
+      K8S_API_TOKEN_PARAM: apiTokenParam.name,
       WORKER_INSTANCE_PROFILE: masterInstanceProfile.name,
       PODS_PER_NODE: "10",
       MAX_BATCH_UP: "2",
@@ -607,6 +607,44 @@ new aws.lambda.Permission("k3s-autoscaler-allow-eventbridge", {
   function: autoscalerFn.name,
   principal: "events.amazonaws.com",
   sourceArn: scheduleRule.arn,
+});
+
+const spotInterruptRule = new aws.cloudwatch.EventRule("spot-interruption", {
+  eventPattern: JSON.stringify({
+    source: ["aws.ec2"],
+    "detail-type": ["EC2 Spot Instance Interruption Warning"],
+  }),
+});
+
+new aws.cloudwatch.EventTarget("spot-interruption-target", {
+  rule: spotInterruptRule.name,
+  arn: autoscalerFn.arn,
+});
+
+new aws.lambda.Permission("allow-spot-interruption", {
+  action: "lambda:InvokeFunction",
+  function: autoscalerFn.name,
+  principal: "events.amazonaws.com",
+  sourceArn: spotInterruptRule.arn,
+});
+
+const spotRebalanceRule = new aws.cloudwatch.EventRule("spot-rebalance", {
+  eventPattern: JSON.stringify({
+    source: ["aws.ec2"],
+    "detail-type": ["EC2 Instance Rebalance Recommendation"],
+  }),
+});
+
+new aws.cloudwatch.EventTarget("spot-rebalance-target", {
+  rule: spotRebalanceRule.name,
+  arn: autoscalerFn.arn,
+});
+
+new aws.lambda.Permission("allow-spot-rebalance", {
+  action: "lambda:InvokeFunction",
+  function: autoscalerFn.name,
+  principal: "events.amazonaws.com",
+  sourceArn: spotRebalanceRule.arn,
 });
 
 const ddbEndpoint = new aws.ec2.VpcEndpoint("ddb-endpoint", {

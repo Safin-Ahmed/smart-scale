@@ -96,7 +96,7 @@ export async function launchWorkers(
   masterIp: string,
   count: number,
   token: string,
-  opts?: { subnetId?: string }
+  opts?: { subnetId?: string; marketType?: "spot" | "on-demand" }
 ) {
   const amiId = process.env.WORKER_AMI_ID!;
   const instanceType = process.env.WORKER_INSTANCE_TYPE ?? "t3.medium";
@@ -120,11 +120,12 @@ export async function launchWorkers(
 
   for (let i = 0; i < count; i++) {
     const subnetId = opts?.subnetId ?? subnetIds[i % subnetIds.length];
+    const isSpot = opts?.marketType === "spot";
 
     const res = await ec2.send(
       new RunInstancesCommand({
         ImageId: amiId,
-        InstanceType: _InstanceType.t3_medium,
+        InstanceType: instanceType as _InstanceType,
         MinCount: 1,
         MaxCount: 1,
         SubnetId: subnetId,
@@ -132,6 +133,7 @@ export async function launchWorkers(
         KeyName: keyName,
         UserData: userDataB64,
         IamInstanceProfile: { Name: profileName },
+        InstanceMarketOptions: isSpot ? { MarketType: "spot" } : undefined,
         TagSpecifications: [
           {
             ResourceType: "instance",
@@ -230,6 +232,19 @@ export async function getPrivateIpsForInstanceIds(instanceIds: string[]) {
   }
 
   return out;
+}
+
+export async function getInstancePrivateIp(
+  instanceId: string
+): Promise<string | null> {
+  const res = await ec2.send(
+    new DescribeInstancesCommand({ InstanceIds: [instanceId] })
+  );
+
+  const instances = res.Reservations?.flatMap((r) => r.Instances ?? []) ?? [];
+  const ip = instances[0]?.PrivateIpAddress ?? null;
+
+  return ip;
 }
 
 // Terminate EC2 Instances

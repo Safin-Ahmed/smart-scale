@@ -6,7 +6,7 @@
 
 SmartScale is an intelligent, Lambda supported autoscaler system for a self managed **K3s Kubernetes cluster running on AWS EC2**.
 
-It dynamically provisions and deprovisions worker nodes based on real-time cluster demand, without relying on managed kubernetes services or cloud-native autoscalers. The system is designed with safety, correctnes and cost efficiency as first-class concerns.
+It dynamically provisions and deprovisions worker nodes based on real-time cluster demand, without relying on managed kubernetes services or cloud-native autoscalers. The system is designed with safety, correctness and cost efficiency as first-class concerns.
 
 SmartScale is built for teams that want:
 
@@ -38,6 +38,7 @@ SmartScale solves this by implementing a transparent, auditable, and determinist
 - Automated EC2 worker provisioning
 - Safe, graceful scale-down using cordon + drain
 - Join verification before capacity is considered ready
+- Cloud-aware behavior (AZ balancing, Spot interruptions)
 - Full Infra as Code (PULUMI)
 - No hardcoded credentials, least-privilege IAM
 
@@ -237,7 +238,6 @@ These trade-offs were made consciously to keep the system simple, auditable and 
 
 ## Improvement Plans
 
-- Spot instance support
 - Predictive scaling
 - Grafana-based scaling dashboards
 - Slack notifications

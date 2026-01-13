@@ -23,7 +23,7 @@ invocations). Without protection, this can cause:
 
 ### Solution
 
-The autoscaler uses **DynamoDB conditional writes** to implement a
+The k3s autoscaler uses **DynamoDB conditional writes** to implement a
 **distributed lock**.
 
 #### Key Mechanisms
