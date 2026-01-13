@@ -217,6 +217,22 @@ This project intentionally prioritizes:
 
 Every scaling decision can be explained after the fact, and that’s the point.
 
+## Bonus Challenges
+
+<br />
+
+### Implemented
+
+- **Multi-AZ awareness** for both scale-up and scale-down, ensuring balanced capacity and zone-level resilience
+- **Spot instance usage with graceful interruption handling**, including fast drain, proactive termination, and AZ-aware on-demand fallback
+
+### Not Implemeneted (Future Improvements)
+
+- Predictive pre-scaling using historical workload trends
+- Custom application level metrics (queue depth, latency, error rates)
+- GitOps-style configuration management with versioned rollouts
+- Pluggable notification system (e.g., Slack, webhooks, incident tools)
+
 ---
 
 **Author:** Safin  
