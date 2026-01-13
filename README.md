@@ -1,250 +1,224 @@
-# SmartScale - K3s Autoscaler on AWS
+# K3s AutoScaler (AWS)
 
- <br />
+A production-grade, event-driven autoscaler for a K3s cluster running on AWS EC2.
 
-## Project Overview
+This project implements **safe scale-up, safe scale-down, multi-AZ awareness, and Spot instance interruption handling** without relying on managed Kubernetes services or built-in autoscalers.
 
-SmartScale is an intelligent, Lambda supported autoscaler system for a self managed **K3s Kubernetes cluster running on AWS EC2**.
+---
 
-It dynamically provisions and deprovisions worker nodes based on real-time cluster demand, without relying on managed kubernetes services or cloud-native autoscalers. The system is designed with safety, correctness and cost efficiency as first-class concerns.
+## Objectives
 
-SmartScale is built for teams that want:
+The primary goals of this system are:
 
-- Full control over their kubernetes infrastructure
-- Predictable scaling behavior
-- Lower cloud costs
-- Clear visibility into scaling decisions
+- Automatically scale worker nodes based on real Kubernetes metrics
+- Guarantee safe node deprovisioning (no workload loss)
+- Maintain high availability across multiple Availability Zones
+- Leverage Spot instances safely with automatic fallback
+- Keep observability infrastructure stable and isolated
 
-<br />
+This design favors **correctness and safety over aggressive scaling**.
 
-## Why SmartScale Exists
+---
 
-Running Kubernetes on raw EC2 gives flexibility but scaling becomes painful:
+## High-Level Architecture
 
-- Fixed worker counts waste money during off-peak hours
-- Traffic spikes cause pod backlogs and outages
-- Manual scaling is slow and error-prone
-- Default cluster autoscalers hide too much logic and state
+**Core components:**
 
-SmartScale solves this by implementing a transparent, auditable, and deterministic autoscaling pipeline that works directly with EC2 and K3s.
+- **K3s Cluster**
+  - 1× Control Plane (Master)
+  - N× Worker Nodes (Spot + On-Demand)
+- **Prometheus**
+  - Deployed inside cluster
+  - Pinned to master node
+- **Autoscaler (AWS Lambda)**
+  - Poll-based scaling
+  - Event-driven interruption handling
+- **DynamoDB**
+  - State management
+  - Distributed locking
+- **AWS EC2**
+  - Worker lifecycle management
+- **AWS SSM Parameter Store**
+  - Secure token storage
 
-<br />
+---
 
-## Key Features
+## Key Design Decisions
 
-- Event-driven autoscaling using AWS Lambda
-- Distributed lock and state management via DynamoDB
-- Prometheus-driven, metric-based scaling decisions
-- Automated EC2 worker provisioning
-- Safe, graceful scale-down using cordon + drain
-- Join verification before capacity is considered ready
-- Cloud-aware behavior (AZ balancing, Spot interruptions)
-- Full Infra as Code (PULUMI)
-- No hardcoded credentials, least-privilege IAM
+### 1. Master Node Is Never Deprovisioned
 
-<br />
+- Hosts:
+  - Kubernetes control plane
+  - Prometheus monitoring stack
+- Tainted to prevent application workloads
+- Guarantees observability and API availability during scaling events
 
-## Architecture
+---
 
-**Core Components**
+### 2. Metrics-Driven Autoscaling
 
-- **AWS Lambda (VPC-enabled)**<br />
-  Executes autoscaling logic on a fixed schedule
-- **Amazon DynamoDB**<br />
-  Executes autoscaling logic on a fixed schedule
-- **Prometheus (in-cluster)**<br />
-  Provides real-time CPU, memory, and pod level metrics
-- **Amazon EC2**<br/>
-  Hosts the K3s control plane and dynamically managed worker nodes
-- **EventBridge**<br />
-  Triggers autoscaler evaluation at regular intervals (2 mins)
+Scaling decisions are based on:
 
-<br />
+- Average CPU utilization
+- Pending pod count
+- Duration-based thresholds (not instantaneous spikes)
 
-## Scaling Workflow
+All decisions are **time-aware and stateful**.
 
-1. Lambda is triggered on a schedule
-2. A distributed lock is acquired in DynamoDB
-3. Cluster metrics are fetched from Prometheus
-4. Scaling decision is evaluated
-5. One of the following happens based on decision: <br />
-   Scale Up: Launch EC2 workers -> auto-join k3s -> verify readiness <br/>
-   Scale Down: Cordon node -> drain workloads -> terminate EC2 instance <br />
-   No-op: Conditions not met
-6. State and decision logs are persisted
-7. Lock is released safely
+---
 
-<br />
+### 3. Safe Scale-Down (Hard Requirement)
 
-## Scaling Logic
+Scale-down strictly follows these rules:
 
-**Scale Up Triggers (any)**
+- Nodes are **cordoned first**
+- Pods are **gracefully evicted**
+- Drain timeout enforced (5 minutes)
+- Nodes with critical system pods are **never terminated**
+- Minimum worker count is always respected
 
-- Average CPU usage > 70% (sustained)
-- Pending pods exist for > 3 minutes
-- Memory utilization > 75%
+If any safety check fails → **NOOP**.
 
-**Scale Down Triggers (all)**
+---
 
-- Average CPU usage < 30% for 10 minutes
-- No Pending Pods
-- Memory utilization < 50%
+### 4. Multi-AZ Awareness (Bonus)
 
-<br />
+- Workers are evenly distributed across AZs
+- Scale-up always targets the **least populated AZ**
+- Scale-down avoids draining an AZ to zero when possible
 
-## Constraints
+This ensures resilience against AZ-level failures.
 
-| Parameter           | Value      |
-| ------------------- | ---------- |
-| Min workers         | 2          |
-| Max workers         | 10         |
-| Scale-up batch      | 1-2 nodes  |
-| Scale-down batch    | 1 node     |
-| Scale-up cooldown   | 5 minutes  |
-| Scale-down cooldown | 10 minutes |
+---
 
-<br />
+### 5. Spot Instance Support with Interruption Handling (Bonus)
 
-## Safety & Correctness Guarantees
+- Workers are launched as **Spot-first**
+- Automatic fallback to On-Demand if Spot capacity is unavailable
+- Spot interruption events trigger:
+  - Immediate graceful drain
+  - Proactive termination
+  - AZ-aware replacement launch
 
-**Distributed Locking**
+This makes Spot usage **safe and predictable**.
 
-- DynamoDB conditional writes prevent concurrent scaling
-- Lock TTL ensures recovery from Lambda timeouts
-- Idempotent scaling actions using action IDs
+---
 
-<br />
+## Autoscaler Execution Model
 
-## Join Verification
+### Poll-Based Scaling
 
-- Newly launched nodes are not trusted immediately
-- Nodes must appear as Ready in Kubernetes
-- Verified via kubernetes api
-- Failed joins are automatically cleaned up
+- Triggered every 2 minutes via EventBridge
+- Evaluates metrics and cluster state
+- Executes **at most one scaling action at a time**
 
-<br />
+### Event-Driven Handling
 
-## Graceful Scale Down
+- Listens for:
+  - EC2 Spot Interruption Warnings
+  - EC2 Rebalance Recommendations
+- Handles node replacement immediately, outside normal polling flow
 
-- Node is cordoned before removal
-- Pods are drained with a timeout
-- System-critical workloads are protected
-- Instance termination only happens after drain success
-
-<br />
-
-## Metrics Used (Prometheus)
-
-- Average CPU usage <br />
-  avg(rate(node_cpu_seconds_total{mode!="idle"}[2m]))
-- Pending pods <br />
-  sum(kube_pod_status_phase{phase="Pending"})
-- Sustained pending pods <br />
-  min_over_time((sum(kube_pod_status_phase{phase="Pending"})) > 0 [3m:])
-- Memory utilization <br />
-  avg(node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)
-
-<br />
+---
 
 ## State Management (DynamoDB)
 
-**State Table** <br />
-Tracks:
+A single DynamoDB record maintains cluster state:
 
-- Scaling in progress
-- Last scaling timestamp
-- Active scale-up action
-- Instances awaiting verification
+- Scaling in progress flag
+- Last scale timestamp
+- Pending/idle tracking
+- Active scale-up action metadata
 
-**Logs Table** <br />
-Stores:
+Conditional writes + distributed locking guarantee:
 
-- Scaling decisions
-- Metrics snapshots
-- Launch and termination events
-- Error diagnostics
+- No double scaling
+- No race conditions
+- Safe recovery from failures
 
-This makes scaling behavior fully auditable.
-
-<br />
-
-## Infrastructure as Code
-
-All infrastructure is defined using Pulumi (TypeScript)
-
-- VPC, subnets, routing
-- Security groups
-- EC2 instances and launch configuration
-- IAM roles and policies
-- Lambda function
-- DynamoDB tables
-- VPC endpoints
-
-The entire system can be recreated from scratch deterministically.
-
-## Testing & Validation
-
-**Scale-Up Test**
-
-```bash
-kubectl scale deploy app --replicas=50
-```
-
-**Scale-Down Test**
-
-```bash
-kubectl scale deploy app --replicas=2
-```
-
-**Failure Scenarios Handled**
-
-- Lambda timeout during scaling
-- Prometheus temporarily unavailable
-- EC2 launch failures
-- Stuck distributed lock
-- Node join failures
-
-<br />
-
-## Cost Efficiency
-
-- Scales down aggressively during low utilization
-- Scales up only when sustained pressure exists
-- Avoids over-provisioning
-- Designed to reduce EC2 costs by 40%-50% in typical workloads
-
-<br />
+---
 
 ## Security Model
 
-- No embedded AWS credentials
-- IAM roles with least privilege
-- Lambda runs inside VPC
-- Prometheus access restricted via security groups
-- Encrypted EC2 volumes
+- Cluster join token stored in **SSM Parameter Store**
+- Kubernetes API token minted via ServiceAccount
+- Lambda has **least-privilege IAM**
+- No secrets baked into AMIs or code
 
-<br />
-<br />
+---
 
-# Limitations & Trade-offs
+## Observability
 
-- Cloudwatch dashboards intentionally not used, instead we stored logs in dynamodb for fast and efficient access.
-- Prometheus exposed via NodePort (network-restricted)
-- Predictive scaling not yet implemented
+### Metrics
 
-These trade-offs were made consciously to keep the system simple, auditable and portable.
+- Collected via Prometheus
+- Queried directly by autoscaler
 
-<br />
+### Dashboards
 
-## Improvement Plans
+- Cluster health
+- Autoscaling decisions
+- AZ distribution
+- Spot stability
 
-- Predictive scaling
-- Grafana-based scaling dashboards
-- Slack notifications
+### Alerts
 
-<br />
+- Autoscaler failures
+- Join timeouts
+- Drain failures
+- Spot replacement failures
 
-## Author
+No alert noise. Only actionable signals.
 
-**Safin Ahmed**<br />
-Sr. Software Engineer
+---
+
+## Folder Structure
+
+K3S-AUTOSCALER
+.
+.
+├── autoscaler/
+│ ├── adapters/
+│ ├── core/
+│ └── handler.ts
+├── infra/
+│ ├── pulumi/
+│ └── k8s/
+├── docs/
+│ ├── component-specifications/
+│ ├── monitoring-and-alerting/
+│ └── bonus/
+└── README.md
+
+---
+
+## What This Is (and Isn’t)
+
+**This is:**
+
+- A real autoscaler implementation
+- Safe, explainable, and deterministic
+- Suitable for small-to-medium clusters
+
+**This is not:**
+
+- A replacement for managed kubernetes service
+- Tied to managed Kubernetes services auto-scaling
+
+---
+
+## Final Notes
+
+This project intentionally prioritizes:
+
+- **Safety over speed**
+- **Correctness over cleverness**
+- **Operational clarity over abstraction**
+
+Every scaling decision can be explained after the fact, and that’s the point.
+
+---
+
+**Author:** Safin  
+**Role:** Senior Software Engineer  
+**Focus:** Systems, reliability, and pragmatic design
