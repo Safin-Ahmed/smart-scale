@@ -175,22 +175,23 @@ No alert noise. Only actionable signals.
 ## Folder Structure
 
 K3S-AUTOSCALER
-.
-.
 ├── autoscaler/
 │ ├── adapters/
 │ ├── core/
-│ └── lambda/handler.ts
+│ └── lambda/
+│ └── handler.ts
 ├── infra/
 │ ├── pulumi/
 │ └── k8s/
+├── services/
+│ └── checkout/
 ├── docs/
-| ├── architecture
-| ├── scaling-algorithm
-| ├── design
+│ ├── architecture.md
+│ ├── scaling-algorithm.md
+│ ├── design.md
 │ ├── component-specifications/
 │ ├── monitoring-and-alerting/
-| ├── testing-strategy
+│ ├── testing-strategy.md
 │ └── bonus/
 └── README.md
 
