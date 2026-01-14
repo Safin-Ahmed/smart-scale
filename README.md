@@ -240,6 +240,25 @@ Every scaling decision can be explained after the fact, and that’s the point.
 
 ---
 
-**Author:** Safin  
+## Lab Environment Note
+
+This project is designed to provision AWS resources via Pulumi (VPC, DynamoDB, EventBridge rules, SSM parameters, EC2 instances, etc.).
+
+In the provided lab AWS account, some services/actions may be restricted (e.g., EventBridge rule creation and/or SSM Parameter Store SecureString creation).  
+If Pulumi fails with permission errors, this is an environment limitation rather than an architecture limitation.
+
+The autoscaler logic and infrastructure definitions remain valid and can be deployed successfully in a standard AWS account with the required permissions.
+
+### Workaround Options
+
+- Use existing pre-created SSM parameters (if provided) and reference by name or just hardcode it in the pulumi code.
+- Skip EventBridge rules in lab and invoke Lambda manually for validation.
+- Deploy the full stack in a personal AWS account with standard IAM permissions.xw
+
+---
+
+<br />
+
+**Author:** EH Safin Ahmed  
 **Role:** Senior Software Engineer  
 **Focus:** Systems, reliability, and pragmatic design

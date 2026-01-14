@@ -5,7 +5,7 @@ aws ec2 create-key-pair \
     --query 'KeyMaterial' \
     --output text > k3s_master_key_v5.pem
 
-chmod 400 k3s_master_key_v5.pem
+chmod 400 k3s_master_key_v6.pem
 
 
 # Tunneling with master node

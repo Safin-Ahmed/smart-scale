@@ -210,10 +210,10 @@ export const lambdaSgId = sgLambda.id;
 export const promNodePort = prometheusNodePort;
 
 // PEM File Name For K3s Master EC2 Instance
-const keyName = "k3s_master_key_v5";
+const keyName = "k3s_master_key_v6";
 
 const sshKey = pulumi.secret(
-  fs.readFileSync(`${process.env.HOME}/.aws/${keyName}.pem`, "utf-8")
+  fs.readFileSync(`${process.env.HOME}/.ssh/aws/${keyName}.pem`, "utf-8")
 );
 
 const masterRole = new aws.iam.Role("k3s-master-role", {

@@ -130,6 +130,8 @@ The Lambda IAM role allows:
 
 IAM access follows least-privilege principles.
 
+**NOTE**: EventBridge rules (scheduled + spot events) require IAM permissions that may be unavailable in restricted lab accounts.
+
 ---
 
 # Fault Tolerance & Safety
