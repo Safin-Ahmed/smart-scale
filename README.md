@@ -4,6 +4,9 @@ A production-grade, event-driven autoscaler for a K3s cluster running on AWS EC2
 
 This project implements **safe scale-up, safe scale-down, multi-AZ awareness, and Spot instance interruption handling** without relying on managed Kubernetes services or built-in autoscalers.
 
+🌐 **Product Landing Page:**  
+https://k3s-scale-wise.lovable.app
+
 ---
 
 ## Objectives
